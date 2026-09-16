@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import uuid
+import hmac
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1166,6 +1167,58 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def require_access_code():
+    # Wenn der Zugang in dieser Sitzung schon freigeschaltet wurde,
+    # muss der Code nicht erneut eingegeben werden.
+    if st.session_state.get("access_granted", False):
+        return
+
+    st.title("🔐 Zugang zur Umfrage")
+
+    st.write(
+        "Bitte geben Sie den Zugangscode ein, "
+        "um zu beginnen."
+    )
+
+    with st.form("access_form"):
+        entered_code = st.text_input(
+            "Zugangscode",
+            type="password",
+        )
+
+        submitted = st.form_submit_button(
+            "Weiter",
+            type="primary",
+        )
+
+    if submitted:
+        try:
+            correct_code = str(
+                st.secrets["ACCESS_CODE"]
+            )
+        except Exception:
+            st.error(
+                "Es wurde noch kein Zugangscode konfiguriert."
+            )
+            st.stop()
+
+        if hmac.compare_digest(
+            entered_code.strip(),
+            correct_code,
+        ):
+            st.session_state.access_granted = True
+            st.rerun()
+
+        else:
+            st.error(
+                "Der Zugangscode ist nicht korrekt."
+            )
+
+    # Alles, was danach in app.py steht, wird erst ausgeführt,
+    # wenn der richtige Code eingegeben wurde.
+    st.stop()
+
+require_access_code()
 
 init_db()
 
