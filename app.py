@@ -1478,7 +1478,7 @@ if submit:
                     assignments,
                 )
 
-           except psycopg.errors.UniqueViolation:
+            except psycopg.errors.UniqueViolation:
                 st.error(
                     "Diese Teilnehmer-ID wurde "
                     "bereits verwendet. "
