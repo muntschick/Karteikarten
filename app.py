@@ -1,16 +1,13 @@
 import json
-import sqlite3
 import tempfile
 import uuid
 import hmac
 from datetime import datetime, timezone
 from pathlib import Path
 
+import psycopg
 import streamlit as st
 import streamlit.components.v1 as components
-
-
-DB_PATH = Path(__file__).with_name("survey.db")
 
 CATEGORIES = ["Pre-A1", "A1", "A2", "B1", "B2"]
 UNASSIGNED = "Noch nicht zugeordnet"
@@ -192,70 +189,110 @@ def is_safe_board_payload(board):
 # Datenbank
 # -------------------------------------------------------------------
 
+# -------------------------------------------------------------------
+# Datenbank: Supabase / PostgreSQL
+# -------------------------------------------------------------------
+
 def get_connection():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=20,
+    """
+    Öffnet eine verschlüsselte Verbindung zur
+    PostgreSQL-Datenbank bei Supabase.
+
+    DATABASE_URL liegt als Secret in
+    Streamlit Community Cloud.
+    """
+    return psycopg.connect(
+        str(st.secrets["DATABASE_URL"]),
+        sslmode="require",
+        connect_timeout=10,
     )
 
-    conn.execute(
-        "PRAGMA foreign_keys = ON;"
-    )
 
-    conn.execute(
-        "PRAGMA journal_mode = WAL;"
-    )
-
-    return conn
-
-
+@st.cache_resource
 def init_db():
+    """
+    Prüft/erstellt die benötigten Tabellen einmal
+    pro Start der Streamlit-App.
+
+    Durch @st.cache_resource wird dieser Code nicht
+    bei jedem Verschieben einer Karte erneut ausgeführt.
+    """
     with get_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS submissions (
-                submission_id TEXT PRIMARY KEY,
-                participant_id TEXT NOT NULL UNIQUE,
-                submitted_at_utc TEXT NOT NULL
-            )
-            """
-        )
+        with conn.cursor() as cur:
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS assignments (
-                submission_id TEXT NOT NULL,
-                card_id TEXT NOT NULL,
-                category TEXT NOT NULL,
-
-                PRIMARY KEY (
-                    submission_id,
-                    card_id
-                ),
-
-                FOREIGN KEY (
-                    submission_id
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.submissions (
+                    submission_id UUID PRIMARY KEY,
+                    participant_id TEXT NOT NULL UNIQUE,
+                    submitted_at_utc TIMESTAMPTZ NOT NULL
                 )
-                REFERENCES submissions(
-                    submission_id
-                )
-                ON DELETE CASCADE
+                """
             )
-            """
-        )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.assignments (
+                    submission_id UUID NOT NULL
+                        REFERENCES public.submissions(submission_id)
+                        ON DELETE CASCADE,
+
+                    card_id TEXT NOT NULL,
+
+                    category TEXT NOT NULL
+                        CHECK (
+                            category IN (
+                                'Pre-A1',
+                                'A1',
+                                'A2',
+                                'B1',
+                                'B2'
+                            )
+                        ),
+
+                    PRIMARY KEY (
+                        submission_id,
+                        card_id
+                    )
+                )
+                """
+            )
+
+            # Zusätzliche Absicherung:
+            # RLS bleibt für beide Tabellen aktiviert.
+            cur.execute(
+                """
+                ALTER TABLE public.submissions
+                ENABLE ROW LEVEL SECURITY
+                """
+            )
+
+            cur.execute(
+                """
+                ALTER TABLE public.assignments
+                ENABLE ROW LEVEL SECURITY
+                """
+            )
+
+    return True
 
 
 def save_submission(
     participant_id,
     assignments,
 ):
-    submission_id = str(
-        uuid.uuid4()
-    )
+    """
+    Speichert eine vollständige Abgabe als eine
+    PostgreSQL-Transaktion.
 
-    submitted_at = (
-        datetime.now(timezone.utc)
-        .isoformat()
+    Entweder werden die Abgabe UND alle 50 Zuordnungen
+    gespeichert oder gar nichts.
+    """
+
+    submission_id = uuid.uuid4()
+
+    submitted_at = datetime.now(
+        timezone.utc
     )
 
     rows = [
@@ -269,36 +306,37 @@ def save_submission(
     ]
 
     with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO submissions (
-                submission_id,
-                participant_id,
-                submitted_at_utc
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                INSERT INTO public.submissions (
+                    submission_id,
+                    participant_id,
+                    submitted_at_utc
+                )
+                VALUES (%s, %s, %s)
+                """,
+                (
+                    submission_id,
+                    participant_id,
+                    submitted_at,
+                ),
             )
-            VALUES (?, ?, ?)
-            """,
-            (
-                submission_id,
-                participant_id,
-                submitted_at,
-            ),
-        )
 
-        conn.executemany(
-            """
-            INSERT INTO assignments (
-                submission_id,
-                card_id,
-                category
+            cur.executemany(
+                """
+                INSERT INTO public.assignments (
+                    submission_id,
+                    card_id,
+                    category
+                )
+                VALUES (%s, %s, %s)
+                """,
+                rows,
             )
-            VALUES (?, ?, ?)
-            """,
-            rows,
-        )
 
-    return submission_id
-
+    return str(submission_id)
 
 # -------------------------------------------------------------------
 # Eigene Drag&Drop-Komponente
@@ -1440,19 +1478,24 @@ if submit:
                     assignments,
                 )
 
-            except sqlite3.IntegrityError:
+           except psycopg.errors.UniqueViolation:
                 st.error(
                     "Diese Teilnehmer-ID wurde "
                     "bereits verwendet. "
                     "Bitte prüfen Sie die ID "
                     "oder verwenden Sie eine andere."
                 )
-
-            except sqlite3.Error as exc:
+            
+            except psycopg.Error as exc:
+                # Technische Details nur im Streamlit-Log ausgeben.
+                print(
+                    "PostgreSQL-Datenbankfehler:",
+                    repr(exc),
+                )
+            
                 st.error(
-                    "Beim Speichern ist ein "
-                    "Datenbankfehler aufgetreten. "
-                    f"Details: {exc}"
+                    "Beim Speichern ist ein Datenbankfehler "
+                    "aufgetreten. Bitte versuchen Sie es erneut."
                 )
 
             else:
