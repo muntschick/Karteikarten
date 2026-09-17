@@ -1,12 +1,14 @@
 import csv
 import io
 import json
+import math
 import tempfile
 import uuid
 import hmac
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 import psycopg
 import streamlit as st
 import streamlit.components.v1 as components
@@ -341,8 +343,7 @@ def save_submission(
     return str(submission_id)
 def load_results():
     """
-    Lädt alle bisher abgegebenen Ergebnisse
-    aus Supabase/PostgreSQL.
+    Lädt alle bisher abgegebenen Ergebnisse aus Supabase/PostgreSQL.
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -368,11 +369,9 @@ def load_results():
 
 def create_results_csv(rows):
     """
-    Erzeugt die CSV vollständig im Arbeitsspeicher.
-    Es wird keine Datei auf dem Streamlit-Server angelegt.
+    Erzeugt die Rohdaten-CSV vollständig im Arbeitsspeicher.
     """
     output = io.StringIO()
-
     writer = csv.writer(output)
 
     writer.writerow(
@@ -390,14 +389,11 @@ def create_results_csv(rows):
         card_id,
         category,
     ) in rows:
-
         if hasattr(
             submitted_at,
             "isoformat",
         ):
-            submitted_at = (
-                submitted_at.isoformat()
-            )
+            submitted_at = submitted_at.isoformat()
 
         writer.writerow(
             [
@@ -408,29 +404,826 @@ def create_results_csv(rows):
             ]
         )
 
-    # UTF-8 mit BOM:
-    # dadurch klappt das Öffnen mit Excel
-    # in der Regel problemloser.
     return output.getvalue().encode(
         "utf-8-sig"
     )
-    
-def render_admin_area():
-    with st.sidebar:
 
+
+def results_to_dataframe(rows):
+    """
+    Wandelt die Rohdaten aus PostgreSQL in einen DataFrame um.
+    """
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "participant_id",
+            "submitted_at_utc",
+            "card_id",
+            "category",
+        ],
+    )
+
+    if not df.empty:
+        df["submitted_at_utc"] = pd.to_datetime(
+            df["submitted_at_utc"],
+            utc=True,
+        )
+
+    return df
+
+
+def build_submission_overview(raw_df):
+    """
+    Eine Zeile pro Submission/Teilnehmer-ID.
+    """
+    if raw_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Teilnehmer-ID",
+                "Zeitpunkt (UTC)",
+                "Karten",
+            ]
+        )
+
+    grouped = (
+        raw_df
+        .groupby(
+            [
+                "participant_id",
+                "submitted_at_utc",
+            ],
+            as_index=False,
+        )
+        .agg(
+            Karten=(
+                "card_id",
+                "nunique",
+            )
+        )
+        .sort_values(
+            "submitted_at_utc",
+            ascending=False,
+        )
+    )
+
+    grouped["Zeitpunkt (UTC)"] = (
+        grouped["submitted_at_utc"]
+        .dt.strftime(
+            "%d.%m.%Y %H:%M:%S UTC"
+        )
+    )
+
+    grouped = grouped.rename(
+        columns={
+            "participant_id":
+                "Teilnehmer-ID",
+        }
+    )
+
+    return grouped[
+        [
+            "Teilnehmer-ID",
+            "Zeitpunkt (UTC)",
+            "Karten",
+        ]
+    ]
+
+
+def build_card_analysis(raw_df):
+    """
+    Berechnet pro Karte:
+    - Häufigkeit je CEFR-Kategorie
+    - Mehrheitskategorie
+    - Übereinstimmung
+    - Dissens
+    - Spannweite
+    - normalisierte Entropie
+    """
+    rows = []
+
+    category_positions = {
+        category: index
+        for index, category
+        in enumerate(CATEGORIES)
+    }
+
+    for card_id in sorted(CARDS):
+        card_rows = raw_df[
+            raw_df["card_id"]
+            == card_id
+        ]
+
+        counts_series = (
+            card_rows["category"]
+            .value_counts()
+            .reindex(
+                CATEGORIES,
+                fill_value=0,
+            )
+        )
+
+        counts = {
+            category:
+                int(counts_series[category])
+            for category
+            in CATEGORIES
+        }
+
+        number_ratings = int(
+            counts_series.sum()
+        )
+
+        if number_ratings > 0:
+            max_count = int(
+                counts_series.max()
+            )
+
+            modal_categories = [
+                category
+                for category
+                in CATEGORIES
+                if (
+                    counts[category]
+                    == max_count
+                )
+            ]
+
+            majority = " / ".join(
+                modal_categories
+            )
+
+            agreement = (
+                max_count
+                / number_ratings
+                * 100
+            )
+
+            dissent = (
+                100
+                - agreement
+            )
+
+            used_positions = [
+                category_positions[
+                    category
+                ]
+                for category
+                in CATEGORIES
+                if counts[category] > 0
+            ]
+
+            spread = (
+                max(used_positions)
+                - min(used_positions)
+            )
+
+            probabilities = [
+                counts[category]
+                / number_ratings
+                for category
+                in CATEGORIES
+                if counts[category] > 0
+            ]
+
+            entropy = (
+                -sum(
+                    probability
+                    * math.log(
+                        probability
+                    )
+                    for probability
+                    in probabilities
+                )
+                / math.log(
+                    len(CATEGORIES)
+                )
+                * 100
+            )
+
+        else:
+            majority = "—"
+            agreement = 0.0
+            dissent = 0.0
+            spread = 0
+            entropy = 0.0
+
+        rows.append(
+            {
+                "Karte":
+                    card_id,
+
+                "Text":
+                    CARDS[card_id],
+
+                "Bewertungen":
+                    number_ratings,
+
+                "Pre-A1":
+                    counts["Pre-A1"],
+
+                "A1":
+                    counts["A1"],
+
+                "A2":
+                    counts["A2"],
+
+                "B1":
+                    counts["B1"],
+
+                "B2":
+                    counts["B2"],
+
+                "Mehrheit":
+                    majority,
+
+                "Übereinstimmung %":
+                    round(
+                        agreement,
+                        1,
+                    ),
+
+                "Dissens %":
+                    round(
+                        dissent,
+                        1,
+                    ),
+
+                "Spannweite":
+                    spread,
+
+                "Entropie %":
+                    round(
+                        entropy,
+                        1,
+                    ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+def make_card_distribution_df(
+    card_row,
+):
+    """
+    Kleine Tabelle für das Balkendiagramm einer einzelnen Karte.
+    """
+    return pd.DataFrame(
+        {
+            "Kategorie":
+                CATEGORIES,
+
+            "Anzahl":
+                [
+                    int(
+                        card_row[
+                            category
+                        ]
+                    )
+                    for category
+                    in CATEGORIES
+                ],
+        }
+    ).set_index(
+        "Kategorie"
+    )
+
+
+def render_card_detail(
+    card_analysis_df,
+    card_id,
+):
+    """
+    Detailansicht einer Karte mit Kennzahlen und Verteilung.
+    """
+    card_row = (
+        card_analysis_df[
+            card_analysis_df["Karte"]
+            == card_id
+        ]
+        .iloc[0]
+    )
+
+    st.markdown(
+        f"### {card_id}"
+    )
+
+    st.write(
+        card_row["Text"]
+    )
+
+    metric_1, metric_2, metric_3, metric_4 = (
+        st.columns(4)
+    )
+
+    metric_1.metric(
+        "Mehrheit",
+        card_row["Mehrheit"],
+    )
+
+    metric_2.metric(
+        "Übereinstimmung",
+        f"{card_row['Übereinstimmung %']:.1f} %",
+    )
+
+    metric_3.metric(
+        "Spannweite",
+        int(
+            card_row["Spannweite"]
+        ),
+    )
+
+    metric_4.metric(
+        "Entropie",
+        f"{card_row['Entropie %']:.1f} %",
+    )
+
+    distribution_df = (
+        make_card_distribution_df(
+            card_row
+        )
+    )
+
+    st.bar_chart(
+        distribution_df,
+        y="Anzahl",
+    )
+
+
+def render_admin_dashboard(
+    rows,
+):
+    """
+    Das eigentliche Dashboard mit fünf Ansichten.
+    """
+    raw_df = results_to_dataframe(
+        rows
+    )
+
+    submissions_df = (
+        build_submission_overview(
+            raw_df
+        )
+    )
+
+    card_analysis_df = (
+        build_card_analysis(
+            raw_df
+        )
+    )
+
+    number_submissions = len(
+        submissions_df
+    )
+
+    number_assignments = len(
+        raw_df
+    )
+
+    perfect_consensus_count = int(
+        (
+            card_analysis_df[
+                "Übereinstimmung %"
+            ]
+            == 100.0
+        ).sum()
+    )
+
+    low_agreement_count = int(
+        (
+            (
+                card_analysis_df[
+                    "Übereinstimmung %"
+                ]
+                < 50.0
+            )
+            & (
+                card_analysis_df[
+                    "Bewertungen"
+                ]
+                > 0
+            )
+        ).sum()
+    )
+
+    if submissions_df.empty:
+        last_submission = "—"
+    else:
+        last_submission = (
+            submissions_df.iloc[0][
+                "Zeitpunkt (UTC)"
+            ]
+        )
+
+    st.title(
+        "📊 Admin-Dashboard"
+    )
+
+    top_left, top_right = (
+        st.columns(
+            [3, 1]
+        )
+    )
+
+    with top_left:
+        st.caption(
+            "Die Kennzahlen werden live aus "
+            "Supabase/PostgreSQL berechnet."
+        )
+
+    with top_right:
+        if st.button(
+            "← Zur Umfrage",
+            use_container_width=True,
+        ):
+            st.session_state[
+                "admin_dashboard_open"
+            ] = False
+
+            st.rerun()
+
+    (
+        tab_overview,
+        tab_submissions,
+        tab_cards,
+        tab_consensus,
+        tab_dissent,
+    ) = st.tabs(
+        [
+            "📌 Überblick",
+            "🧾 Abgaben",
+            "🗂️ Kartenanalyse",
+            "✅ TOP Konsens",
+            "⚠️ Problemfälle",
+        ]
+    )
+
+    # ---------------------------------------------------------
+    # 1. Überblick
+    # ---------------------------------------------------------
+    with tab_overview:
+        (
+            metric_1,
+            metric_2,
+            metric_3,
+            metric_4,
+        ) = st.columns(4)
+
+        metric_1.metric(
+            "Abgaben",
+            number_submissions,
+        )
+
+        metric_2.metric(
+            "Zuordnungen",
+            number_assignments,
+        )
+
+        metric_3.metric(
+            "100 % Konsens",
+            perfect_consensus_count,
+        )
+
+        metric_4.metric(
+            "< 50 % Übereinstimmung",
+            low_agreement_count,
+        )
+
+        st.write(
+            f"**Letzte Abgabe:** "
+            f"{last_submission}"
+        )
+
+        st.divider()
+
+        st.subheader(
+            "Downloads"
+        )
+
+        raw_csv = (
+            create_results_csv(
+                rows
+            )
+        )
+
+        analysis_csv = (
+            card_analysis_df
+            .to_csv(
+                index=False,
+            )
+            .encode(
+                "utf-8-sig"
+            )
+        )
+
+        download_1, download_2 = (
+            st.columns(2)
+        )
+
+        with download_1:
+            st.download_button(
+                label=(
+                    "📥 Rohdaten als CSV"
+                ),
+                data=raw_csv,
+                file_name=(
+                    "ergebnisse_rohdaten.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        with download_2:
+            st.download_button(
+                label=(
+                    "📥 Kartenanalyse als CSV"
+                ),
+                data=analysis_csv,
+                file_name=(
+                    "kartenanalyse.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        st.caption(
+            "Übereinstimmung = Anteil der häufigsten "
+            "Einstufung. Spannweite = Abstand zwischen "
+            "der niedrigsten und höchsten verwendeten "
+            "CEFR-Kategorie. Entropie beschreibt, wie "
+            "stark sich die Antworten über mehrere "
+            "Kategorien verteilen."
+        )
+
+    # ---------------------------------------------------------
+    # 2. Alle Submissions
+    # ---------------------------------------------------------
+    with tab_submissions:
+        st.subheader(
+            "Alle Abgaben"
+        )
+
+        if submissions_df.empty:
+            st.info(
+                "Noch keine Abgaben vorhanden."
+            )
+
+        else:
+            st.dataframe(
+                submissions_df,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    # ---------------------------------------------------------
+    # 3. Analyse aller Karten
+    # ---------------------------------------------------------
+    with tab_cards:
+        st.subheader(
+            "Alle Karteikarten"
+        )
+
+        st.dataframe(
+            card_analysis_df,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Übereinstimmung %":
+                    st.column_config.ProgressColumn(
+                        "Übereinstimmung %",
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f %%",
+                    ),
+
+                "Dissens %":
+                    st.column_config.NumberColumn(
+                        "Dissens %",
+                        format="%.1f %%",
+                    ),
+
+                "Entropie %":
+                    st.column_config.NumberColumn(
+                        "Entropie %",
+                        format="%.1f %%",
+                    ),
+            },
+        )
+
+        st.divider()
+
+        selected_card = st.selectbox(
+            "Karte im Detail ansehen",
+            options=(
+                card_analysis_df[
+                    "Karte"
+                ].tolist()
+            ),
+            key=(
+                "admin_card_detail"
+            ),
+        )
+
+        render_card_detail(
+            card_analysis_df,
+            selected_card,
+        )
+
+    # ---------------------------------------------------------
+    # 4. TOP 10 mit vollständigem Konsens
+    # ---------------------------------------------------------
+    with tab_consensus:
+        st.subheader(
+            "TOP 10 – vollständiger Konsens"
+        )
+
+        st.write(
+            "Hier erscheinen nur Karten, bei denen "
+            "**100 % der Teilnehmenden dieselbe "
+            "Kategorie gewählt haben**."
+        )
+
+        perfect_df = (
+            card_analysis_df[
+                (
+                    card_analysis_df[
+                        "Übereinstimmung %"
+                    ]
+                    == 100.0
+                )
+                & (
+                    card_analysis_df[
+                        "Bewertungen"
+                    ]
+                    > 0
+                )
+            ]
+            .sort_values(
+                [
+                    "Bewertungen",
+                    "Karte",
+                ],
+                ascending=[
+                    False,
+                    True,
+                ],
+            )
+            .head(10)
+        )
+
+        if perfect_df.empty:
+            st.info(
+                "Aktuell gibt es keine Karte "
+                "mit 100 % Übereinstimmung."
+            )
+
+        else:
+            st.dataframe(
+                perfect_df[
+                    [
+                        "Karte",
+                        "Text",
+                        "Bewertungen",
+                        "Mehrheit",
+                        "Übereinstimmung %",
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            if (
+                perfect_consensus_count
+                > 10
+            ):
+                st.caption(
+                    f"Insgesamt gibt es "
+                    f"{perfect_consensus_count} "
+                    "Karten mit 100 % Konsens. "
+                    "Angezeigt werden die ersten 10."
+                )
+
+    # ---------------------------------------------------------
+    # 5. Problemfälle / Dissens
+    # ---------------------------------------------------------
+    with tab_dissent:
+        st.subheader(
+            "Besonders problematische Karten"
+        )
+
+        st.write(
+            "Sortierung: zuerst **geringe "
+            "Übereinstimmung**, bei Gleichstand "
+            "eine **größere Spannweite** und danach "
+            "eine **höhere Entropie**."
+        )
+
+        problematic_df = (
+            card_analysis_df[
+                card_analysis_df[
+                    "Bewertungen"
+                ]
+                > 0
+            ]
+            .sort_values(
+                [
+                    "Übereinstimmung %",
+                    "Spannweite",
+                    "Entropie %",
+                ],
+                ascending=[
+                    True,
+                    False,
+                    False,
+                ],
+            )
+            .head(10)
+        )
+
+        if problematic_df.empty:
+            st.info(
+                "Noch keine bewerteten Karten vorhanden."
+            )
+
+        else:
+            st.dataframe(
+                problematic_df[
+                    [
+                        "Karte",
+                        "Text",
+                        "Bewertungen",
+                        "Mehrheit",
+                        "Übereinstimmung %",
+                        "Dissens %",
+                        "Spannweite",
+                        "Entropie %",
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Übereinstimmung %":
+                        st.column_config.ProgressColumn(
+                            "Übereinstimmung %",
+                            min_value=0,
+                            max_value=100,
+                            format="%.1f %%",
+                        ),
+
+                    "Dissens %":
+                        st.column_config.NumberColumn(
+                            "Dissens %",
+                            format="%.1f %%",
+                        ),
+
+                    "Entropie %":
+                        st.column_config.NumberColumn(
+                            "Entropie %",
+                            format="%.1f %%",
+                        ),
+                },
+            )
+
+            st.divider()
+
+            selected_problem_card = (
+                st.selectbox(
+                    "Problemkarte im Detail",
+                    options=(
+                        problematic_df[
+                            "Karte"
+                        ].tolist()
+                    ),
+                    key=(
+                        "admin_problem_detail"
+                    ),
+                )
+            )
+
+            render_card_detail(
+                card_analysis_df,
+                selected_problem_card,
+            )
+
+
+def render_admin_area():
+    """
+    Login in der Seitenleiste.
+    Nach erfolgreicher Anmeldung wird das Dashboard
+    im Hauptbereich geöffnet.
+    """
+    with st.sidebar:
         with st.expander(
             "🔒 Admin-Bereich",
             expanded=False,
         ):
 
-            # ---------------------------------
-            # Noch nicht als Admin angemeldet
-            # ---------------------------------
             if not st.session_state.get(
                 "admin_granted",
                 False,
             ):
-
                 with st.form(
                     "admin_login_form"
                 ):
@@ -457,8 +1250,8 @@ def render_admin_area():
 
                     except Exception:
                         st.error(
-                            "ADMIN_CODE wurde "
-                            "noch nicht in den "
+                            "ADMIN_CODE wurde noch "
+                            "nicht in den "
                             "Streamlit-Secrets "
                             "konfiguriert."
                         )
@@ -473,70 +1266,32 @@ def render_admin_area():
                             "admin_granted"
                         ] = True
 
+                        st.session_state[
+                            "admin_dashboard_open"
+                        ] = True
+
                         st.rerun()
 
                     else:
                         st.error(
-                            "Admin-Code "
-                            "nicht korrekt."
+                            "Admin-Code nicht korrekt."
                         )
 
                 return
 
-            # ---------------------------------
-            # Admin ist angemeldet
-            # ---------------------------------
-            try:
-                rows = load_results()
-
-            except psycopg.Error as exc:
-                print(
-                    "Fehler beim Laden "
-                    "der Admin-Daten:",
-                    repr(exc),
-                )
-
-                st.error(
-                    "Die Ergebnisse konnten "
-                    "nicht geladen werden."
-                )
-
-                return
-
-            participant_ids = {
-                row[0]
-                for row in rows
-            }
-
-            number_submissions = len(
-                participant_ids
+            st.success(
+                "Admin angemeldet"
             )
 
-            number_assignments = len(
-                rows
-            )
-
-            st.metric(
-                "Abgaben",
-                number_submissions,
-            )
-
-            st.caption(
-                f"{number_assignments} "
-                "Karten-Zuordnungen gespeichert"
-            )
-
-            csv_data = create_results_csv(
-                rows
-            )
-
-            st.download_button(
-                label="📥 Ergebnisse als CSV",
-                data=csv_data,
-                file_name="ergebnisse.csv",
-                mime="text/csv",
+            if st.button(
+                "📊 Dashboard öffnen",
                 use_container_width=True,
-            )
+            ):
+                st.session_state[
+                    "admin_dashboard_open"
+                ] = True
+
+                st.rerun()
 
             if st.button(
                 "Admin abmelden",
@@ -546,7 +1301,51 @@ def render_admin_area():
                     "admin_granted"
                 ] = False
 
+                st.session_state[
+                    "admin_dashboard_open"
+                ] = False
+
                 st.rerun()
+
+    if not st.session_state.get(
+        "admin_granted",
+        False,
+    ):
+        return
+
+    if not st.session_state.get(
+        "admin_dashboard_open",
+        False,
+    ):
+        return
+
+    try:
+        rows = load_results()
+
+    except psycopg.Error as exc:
+        print(
+            "Fehler beim Laden "
+            "der Admin-Daten:",
+            repr(exc),
+        )
+
+        st.error(
+            "Die Ergebnisse konnten "
+            "nicht geladen werden."
+        )
+
+        st.stop()
+
+    render_admin_dashboard(
+        rows
+    )
+
+    # Wenn das Dashboard offen ist, wird darunter
+    # nicht zusätzlich die Teilnehmeransicht gerendert.
+    st.stop()
+
+
+
 # -------------------------------------------------------------------
 # Eigene Drag&Drop-Komponente
 # -------------------------------------------------------------------
