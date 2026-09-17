@@ -415,7 +415,7 @@ def create_results_csv(rows):
         "utf-8-sig"
     )
     
- def render_admin_area():
+def render_admin_area():
     with st.sidebar:
 
         with st.expander(
