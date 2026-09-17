@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import tempfile
 import uuid
@@ -337,7 +339,214 @@ def save_submission(
             )
 
     return str(submission_id)
+def load_results():
+    """
+    Lädt alle bisher abgegebenen Ergebnisse
+    aus Supabase/PostgreSQL.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.participant_id,
+                    s.submitted_at_utc,
+                    a.card_id,
+                    a.category
+                FROM public.submissions AS s
+                JOIN public.assignments AS a
+                    ON a.submission_id = s.submission_id
+                ORDER BY
+                    s.submitted_at_utc,
+                    s.participant_id,
+                    a.card_id
+                """
+            )
 
+            return cur.fetchall()
+
+
+def create_results_csv(rows):
+    """
+    Erzeugt die CSV vollständig im Arbeitsspeicher.
+    Es wird keine Datei auf dem Streamlit-Server angelegt.
+    """
+    output = io.StringIO()
+
+    writer = csv.writer(output)
+
+    writer.writerow(
+        [
+            "participant_id",
+            "submitted_at_utc",
+            "card_id",
+            "category",
+        ]
+    )
+
+    for (
+        participant_id,
+        submitted_at,
+        card_id,
+        category,
+    ) in rows:
+
+        if hasattr(
+            submitted_at,
+            "isoformat",
+        ):
+            submitted_at = (
+                submitted_at.isoformat()
+            )
+
+        writer.writerow(
+            [
+                participant_id,
+                submitted_at,
+                card_id,
+                category,
+            ]
+        )
+
+    # UTF-8 mit BOM:
+    # dadurch klappt das Öffnen mit Excel
+    # in der Regel problemloser.
+    return output.getvalue().encode(
+        "utf-8-sig"
+    )
+    
+ def render_admin_area():
+    with st.sidebar:
+
+        with st.expander(
+            "🔒 Admin-Bereich",
+            expanded=False,
+        ):
+
+            # ---------------------------------
+            # Noch nicht als Admin angemeldet
+            # ---------------------------------
+            if not st.session_state.get(
+                "admin_granted",
+                False,
+            ):
+
+                with st.form(
+                    "admin_login_form"
+                ):
+                    entered_admin_code = (
+                        st.text_input(
+                            "Admin-Code",
+                            type="password",
+                        )
+                    )
+
+                    login = (
+                        st.form_submit_button(
+                            "Admin öffnen"
+                        )
+                    )
+
+                if login:
+                    try:
+                        correct_admin_code = str(
+                            st.secrets[
+                                "ADMIN_CODE"
+                            ]
+                        )
+
+                    except Exception:
+                        st.error(
+                            "ADMIN_CODE wurde "
+                            "noch nicht in den "
+                            "Streamlit-Secrets "
+                            "konfiguriert."
+                        )
+
+                        return
+
+                    if hmac.compare_digest(
+                        entered_admin_code.strip(),
+                        correct_admin_code,
+                    ):
+                        st.session_state[
+                            "admin_granted"
+                        ] = True
+
+                        st.rerun()
+
+                    else:
+                        st.error(
+                            "Admin-Code "
+                            "nicht korrekt."
+                        )
+
+                return
+
+            # ---------------------------------
+            # Admin ist angemeldet
+            # ---------------------------------
+            try:
+                rows = load_results()
+
+            except psycopg.Error as exc:
+                print(
+                    "Fehler beim Laden "
+                    "der Admin-Daten:",
+                    repr(exc),
+                )
+
+                st.error(
+                    "Die Ergebnisse konnten "
+                    "nicht geladen werden."
+                )
+
+                return
+
+            participant_ids = {
+                row[0]
+                for row in rows
+            }
+
+            number_submissions = len(
+                participant_ids
+            )
+
+            number_assignments = len(
+                rows
+            )
+
+            st.metric(
+                "Abgaben",
+                number_submissions,
+            )
+
+            st.caption(
+                f"{number_assignments} "
+                "Karten-Zuordnungen gespeichert"
+            )
+
+            csv_data = create_results_csv(
+                rows
+            )
+
+            st.download_button(
+                label="📥 Ergebnisse als CSV",
+                data=csv_data,
+                file_name="ergebnisse.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            if st.button(
+                "Admin abmelden",
+                use_container_width=True,
+            ):
+                st.session_state[
+                    "admin_granted"
+                ] = False
+
+                st.rerun()
 # -------------------------------------------------------------------
 # Eigene Drag&Drop-Komponente
 # -------------------------------------------------------------------
@@ -1260,6 +1469,7 @@ require_access_code()
 
 init_db()
 
+render_admin_area()
 
 if "board" not in st.session_state:
     st.session_state.board = (
