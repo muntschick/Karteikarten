@@ -664,94 +664,21 @@ def build_card_analysis(raw_df):
     )
 
 
-def make_card_distribution_df(
-    card_row,
-):
+
+def full_table_height(df):
     """
-    Kleine Tabelle für das Balkendiagramm einer einzelnen Karte.
+    Berechnet genug Höhe, damit ein st.dataframe
+    alle Zeilen ohne eigenen vertikalen Scrollbereich zeigt.
     """
-    return pd.DataFrame(
-        {
-            "Kategorie":
-                CATEGORIES,
+    row_height = 35
+    header_height = 40
+    padding = 8
 
-            "Anzahl":
-                [
-                    int(
-                        card_row[
-                            category
-                        ]
-                    )
-                    for category
-                    in CATEGORIES
-                ],
-        }
-    ).set_index(
-        "Kategorie"
+    return (
+        header_height
+        + len(df) * row_height
+        + padding
     )
-
-
-def render_card_detail(
-    card_analysis_df,
-    card_id,
-):
-    """
-    Detailansicht einer Karte mit Kennzahlen und Verteilung.
-    """
-    card_row = (
-        card_analysis_df[
-            card_analysis_df["Karte"]
-            == card_id
-        ]
-        .iloc[0]
-    )
-
-    st.markdown(
-        f"### {card_id}"
-    )
-
-    st.write(
-        card_row["Text"]
-    )
-
-    metric_1, metric_2, metric_3, metric_4 = (
-        st.columns(4)
-    )
-
-    metric_1.metric(
-        "Mehrheit",
-        card_row["Mehrheit"],
-    )
-
-    metric_2.metric(
-        "Übereinstimmung",
-        f"{card_row['Übereinstimmung %']:.1f} %",
-    )
-
-    metric_3.metric(
-        "Spannweite",
-        int(
-            card_row["Spannweite"]
-        ),
-    )
-
-    metric_4.metric(
-        "Entropie",
-        f"{card_row['Entropie %']:.1f} %",
-    )
-
-    distribution_df = (
-        make_card_distribution_df(
-            card_row
-        )
-    )
-
-    st.bar_chart(
-        distribution_df,
-        y="Anzahl",
-    )
-
-
 def render_admin_dashboard(
     rows,
 ):
@@ -975,6 +902,9 @@ def render_admin_dashboard(
                 submissions_df,
                 hide_index=True,
                 use_container_width=True,
+                height=full_table_height(
+                    submissions_df
+                ),
             )
 
     # ---------------------------------------------------------
@@ -989,6 +919,9 @@ def render_admin_dashboard(
             card_analysis_df,
             hide_index=True,
             use_container_width=True,
+            height=full_table_height(
+                card_analysis_df
+            ),
             column_config={
                 "Übereinstimmung %":
                     st.column_config.ProgressColumn(
@@ -997,38 +930,19 @@ def render_admin_dashboard(
                         max_value=100,
                         format="%.1f %%",
                     ),
-
+        
                 "Dissens %":
                     st.column_config.NumberColumn(
                         "Dissens %",
                         format="%.1f %%",
                     ),
-
+        
                 "Entropie %":
                     st.column_config.NumberColumn(
                         "Entropie %",
                         format="%.1f %%",
                     ),
             },
-        )
-
-        st.divider()
-
-        selected_card = st.selectbox(
-            "Karte im Detail ansehen",
-            options=(
-                card_analysis_df[
-                    "Karte"
-                ].tolist()
-            ),
-            key=(
-                "admin_card_detail"
-            ),
-        )
-
-        render_card_detail(
-            card_analysis_df,
-            selected_card,
         )
 
     # ---------------------------------------------------------
@@ -1163,6 +1077,9 @@ def render_admin_dashboard(
                 ],
                 hide_index=True,
                 use_container_width=True,
+                height=full_table_height(
+                    problematic_df
+                ),
                 column_config={
                     "Übereinstimmung %":
                         st.column_config.ProgressColumn(
@@ -1171,13 +1088,13 @@ def render_admin_dashboard(
                             max_value=100,
                             format="%.1f %%",
                         ),
-
+            
                     "Dissens %":
                         st.column_config.NumberColumn(
                             "Dissens %",
                             format="%.1f %%",
                         ),
-
+            
                     "Entropie %":
                         st.column_config.NumberColumn(
                             "Entropie %",
@@ -1185,28 +1102,6 @@ def render_admin_dashboard(
                         ),
                 },
             )
-
-            st.divider()
-
-            selected_problem_card = (
-                st.selectbox(
-                    "Problemkarte im Detail",
-                    options=(
-                        problematic_df[
-                            "Karte"
-                        ].tolist()
-                    ),
-                    key=(
-                        "admin_problem_detail"
-                    ),
-                )
-            )
-
-            render_card_detail(
-                card_analysis_df,
-                selected_problem_card,
-            )
-
 
 def render_admin_area():
     """
