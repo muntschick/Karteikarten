@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import math
+import random
 import tempfile
 import uuid
 import hmac
@@ -13,52 +14,59 @@ import psycopg
 import streamlit as st
 import streamlit.components.v1 as components
 
-CATEGORIES = ["Pre-A1", "A1", "A2", "B1", "B2"]
+
+LEVELS = ["Pre-A1", "A1", "A2", "B1", "B2"]
 UNASSIGNED = "Noch nicht zugeordnet"
 
-LOREM_SENTENCES = [
-    "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-    "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
-    "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.",
-    "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum.",
-    "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia.",
-]
-
-CARDS = {
-    f"K{i:02d}": LOREM_SENTENCES[(i - 1) % len(LOREM_SENTENCES)]
-    for i in range(1, 51)
-}
-
-LABEL_TO_ID = {
-    f"{card_id} · {text}": card_id
-    for card_id, text in CARDS.items()
-}
-
-ID_TO_LABEL = {
-    card_id: label
-    for label, card_id in LABEL_TO_ID.items()
-}
+# Diese Variablen werden nach dem Login aus Supabase befüllt.
+# An den Browser werden für die Teilnehmeransicht nur card_id + card_text gegeben.
+CARDS = {}
+CARD_METADATA = {}
+LABEL_TO_ID = {}
+ID_TO_LABEL = {}
 
 
 # -------------------------------------------------------------------
 # Board / Daten
 # -------------------------------------------------------------------
 
+def get_random_card_order():
+    """
+    Mischt die Karten pro Browser-Sitzung genau einmal.
+    Die Reihenfolge bleibt danach beim Sortieren und bei Reruns stabil.
+    """
+    current_ids = set(CARDS)
+    stored_order = st.session_state.get("card_order")
+
+    if (
+        not stored_order
+        or set(stored_order) != current_ids
+        or len(stored_order) != len(CARDS)
+    ):
+        card_ids = list(CARDS.keys())
+        random.SystemRandom().shuffle(card_ids)
+        st.session_state.card_order = card_ids
+
+    return st.session_state.card_order
+
+
 def initial_board():
+    card_order = get_random_card_order()
+
     return [
         {
             "header": UNASSIGNED,
             "items": [
                 ID_TO_LABEL[card_id]
-                for card_id in CARDS
+                for card_id in card_order
             ],
         },
         *[
             {
-                "header": category,
+                "header": level,
                 "items": [],
             }
-            for category in CATEGORIES
+            for level in LEVELS
         ],
     ]
 
@@ -67,22 +75,22 @@ def board_to_assignments(board):
     assignments = {}
 
     for container in board:
-        category = container["header"]
+        level = container["header"]
 
-        if category == UNASSIGNED:
+        if level == UNASSIGNED:
             continue
 
         for label in container["items"]:
             card_id = LABEL_TO_ID.get(label)
 
             if card_id:
-                assignments[card_id] = category
+                assignments[card_id] = level
 
     return assignments
 
 
 def validate_board(board):
-    expected_headers = [UNASSIGNED, *CATEGORIES]
+    expected_headers = [UNASSIGNED, *LEVELS]
 
     if not isinstance(board, list):
         return {
@@ -146,25 +154,21 @@ def validate_board(board):
         "duplicate_count": duplicate_count,
         "missing_count": len(missing),
         "unknown_count": len(unknown),
-        "is_valid": (
-            structure_ok
-            and unassigned_count == 0
-        ),
+        "is_valid": structure_ok and unassigned_count == 0,
     }
 
 
 def is_safe_board_payload(board):
     """
-    Prüft, ob der Browser einen plausiblen Board-Zustand
-    zurückgegeben hat, bevor er in den Session State übernommen wird.
+    Prüft, ob der Browser einen plausiblen Board-Zustand zurückgegeben hat.
     """
     if not isinstance(board, list):
         return False
 
-    if len(board) != 6:
+    if len(board) != 1 + len(LEVELS):
         return False
 
-    expected_headers = [UNASSIGNED, *CATEGORIES]
+    expected_headers = [UNASSIGNED, *LEVELS]
 
     try:
         headers = [
@@ -190,21 +194,10 @@ def is_safe_board_payload(board):
 
 
 # -------------------------------------------------------------------
-# Datenbank
-# -------------------------------------------------------------------
-
-# -------------------------------------------------------------------
 # Datenbank: Supabase / PostgreSQL
 # -------------------------------------------------------------------
 
 def get_connection():
-    """
-    Öffnet eine verschlüsselte Verbindung zur
-    PostgreSQL-Datenbank bei Supabase.
-
-    DATABASE_URL liegt als Secret in
-    Streamlit Community Cloud.
-    """
     return psycopg.connect(
         str(st.secrets["DATABASE_URL"]),
         sslmode="require",
@@ -215,15 +208,11 @@ def get_connection():
 @st.cache_resource
 def init_db():
     """
-    Prüft/erstellt die benötigten Tabellen einmal
-    pro Start der Streamlit-App.
-
-    Durch @st.cache_resource wird dieser Code nicht
-    bei jedem Verschieben einer Karte erneut ausgeführt.
+    Prüft die Grundstruktur und migriert bei Bedarf
+    assignments.category -> assignments.level.
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS public.submissions (
@@ -240,30 +229,55 @@ def init_db():
                     submission_id UUID NOT NULL
                         REFERENCES public.submissions(submission_id)
                         ON DELETE CASCADE,
-
                     card_id TEXT NOT NULL,
-
-                    category TEXT NOT NULL
-                        CHECK (
-                            category IN (
-                                'Pre-A1',
-                                'A1',
-                                'A2',
-                                'B1',
-                                'B2'
-                            )
-                        ),
-
-                    PRIMARY KEY (
-                        submission_id,
-                        card_id
-                    )
+                    level TEXT NOT NULL
+                        CHECK (level IN ('Pre-A1', 'A1', 'A2', 'B1', 'B2')),
+                    PRIMARY KEY (submission_id, card_id)
                 )
                 """
             )
 
-            # Zusätzliche Absicherung:
-            # RLS bleibt für beide Tabellen aktiviert.
+            # Bestehende Installation automatisch von "category" auf "level" migrieren.
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'assignments'
+                  AND column_name IN ('category', 'level')
+                """
+            )
+            assignment_columns = {
+                row[0]
+                for row in cur.fetchall()
+            }
+
+            if (
+                "category" in assignment_columns
+                and "level" not in assignment_columns
+            ):
+                cur.execute(
+                    """
+                    ALTER TABLE public.assignments
+                    RENAME COLUMN category TO level
+                    """
+                )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.cards (
+                    card_id TEXT PRIMARY KEY,
+                    card_text TEXT NOT NULL,
+                    reference_level TEXT NOT NULL
+                        CHECK (reference_level IN ('Pre-A1', 'A1', 'A2', 'B1', 'B2')),
+                    item_category TEXT NOT NULL,
+                    category_number SMALLINT NOT NULL,
+                    level_number SMALLINT NOT NULL,
+                    sort_order SMALLINT NOT NULL UNIQUE
+                )
+                """
+            )
+
             cur.execute(
                 """
                 ALTER TABLE public.submissions
@@ -278,40 +292,84 @@ def init_db():
                 """
             )
 
+            cur.execute(
+                """
+                ALTER TABLE public.cards
+                ENABLE ROW LEVEL SECURITY
+                """
+            )
+
     return True
 
 
-def save_submission(
-    participant_id,
-    assignments,
-):
+@st.cache_data(ttl=300)
+def load_cards():
     """
-    Speichert eine vollständige Abgabe als eine
-    PostgreSQL-Transaktion.
-
-    Entweder werden die Abgabe UND alle 50 Zuordnungen
-    gespeichert oder gar nichts.
+    Lädt die Stammdaten in Ihrer fachlichen sort_order.
+    Für die Teilnehmeransicht werden später nur ID + Text verwendet.
     """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    card_id,
+                    card_text,
+                    reference_level,
+                    item_category,
+                    category_number,
+                    level_number,
+                    sort_order
+                FROM public.cards
+                ORDER BY sort_order
+                """
+            )
+            rows = cur.fetchall()
 
+    cards = {}
+    metadata = {}
+
+    for (
+        card_id,
+        card_text,
+        reference_level,
+        item_category,
+        category_number,
+        level_number,
+        sort_order,
+    ) in rows:
+        cards[card_id] = card_text
+        metadata[card_id] = {
+            "card_text": card_text,
+            "reference_level": reference_level,
+            "item_category": item_category,
+            "category_number": int(category_number),
+            "level_number": int(level_number),
+            "sort_order": int(sort_order),
+        }
+
+    return cards, metadata
+
+
+def save_submission(participant_id, assignments):
+    """
+    Speichert eine vollständige Abgabe in einer Transaktion.
+    """
     submission_id = uuid.uuid4()
-
-    submitted_at = datetime.now(
-        timezone.utc
-    )
+    submitted_at = datetime.now(timezone.utc)
 
     rows = [
         (
             submission_id,
             card_id,
-            category,
+            level,
         )
-        for card_id, category
+        for card_id, level
         in sorted(assignments.items())
     ]
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-
             cur.execute(
                 """
                 INSERT INTO public.submissions (
@@ -333,7 +391,7 @@ def save_submission(
                 INSERT INTO public.assignments (
                     submission_id,
                     card_id,
-                    category
+                    level
                 )
                 VALUES (%s, %s, %s)
                 """,
@@ -341,9 +399,12 @@ def save_submission(
             )
 
     return str(submission_id)
+
+
 def load_results():
     """
-    Lädt alle bisher abgegebenen Ergebnisse aus Supabase/PostgreSQL.
+    Lädt die Auswertungsdaten bereits mit den Karten-Stammdaten zusammengeführt.
+    Nur Karten, die aktuell in public.cards vorhanden sind, werden ausgewertet.
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -353,23 +414,30 @@ def load_results():
                     s.participant_id,
                     s.submitted_at_utc,
                     a.card_id,
-                    a.category
+                    a.level AS participant_level,
+                    c.card_text,
+                    c.reference_level,
+                    c.item_category,
+                    c.category_number,
+                    c.level_number,
+                    c.sort_order
                 FROM public.submissions AS s
                 JOIN public.assignments AS a
                     ON a.submission_id = s.submission_id
+                JOIN public.cards AS c
+                    ON c.card_id = a.card_id
                 ORDER BY
                     s.submitted_at_utc,
                     s.participant_id,
-                    a.card_id
+                    c.sort_order
                 """
             )
-
             return cur.fetchall()
 
 
 def create_results_csv(rows):
     """
-    Erzeugt die Rohdaten-CSV vollständig im Arbeitsspeicher.
+    Rohdatenexport inklusive Referenzniveau und Kartenkategorie.
     """
     output = io.StringIO()
     writer = csv.writer(output)
@@ -379,47 +447,39 @@ def create_results_csv(rows):
             "participant_id",
             "submitted_at_utc",
             "card_id",
-            "category",
+            "participant_level",
+            "card_text",
+            "reference_level",
+            "item_category",
+            "category_number",
+            "level_number",
+            "sort_order",
         ]
     )
 
-    for (
-        participant_id,
-        submitted_at,
-        card_id,
-        category,
-    ) in rows:
-        if hasattr(
-            submitted_at,
-            "isoformat",
-        ):
-            submitted_at = submitted_at.isoformat()
+    for row in rows:
+        row = list(row)
+        if hasattr(row[1], "isoformat"):
+            row[1] = row[1].isoformat()
+        writer.writerow(row)
 
-        writer.writerow(
-            [
-                participant_id,
-                submitted_at,
-                card_id,
-                category,
-            ]
-        )
-
-    return output.getvalue().encode(
-        "utf-8-sig"
-    )
+    return output.getvalue().encode("utf-8-sig")
 
 
 def results_to_dataframe(rows):
-    """
-    Wandelt die Rohdaten aus PostgreSQL in einen DataFrame um.
-    """
     df = pd.DataFrame(
         rows,
         columns=[
             "participant_id",
             "submitted_at_utc",
             "card_id",
-            "category",
+            "participant_level",
+            "card_text",
+            "reference_level",
+            "item_category",
+            "category_number",
+            "level_number",
+            "sort_order",
         ],
     )
 
@@ -433,9 +493,6 @@ def results_to_dataframe(rows):
 
 
 def build_submission_overview(raw_df):
-    """
-    Eine Zeile pro Submission/Teilnehmer-ID.
-    """
     if raw_df.empty:
         return pd.DataFrame(
             columns=[
@@ -455,10 +512,7 @@ def build_submission_overview(raw_df):
             as_index=False,
         )
         .agg(
-            Karten=(
-                "card_id",
-                "nunique",
-            )
+            Karten=("card_id", "nunique")
         )
         .sort_values(
             "submitted_at_utc",
@@ -468,15 +522,12 @@ def build_submission_overview(raw_df):
 
     grouped["Zeitpunkt (UTC)"] = (
         grouped["submitted_at_utc"]
-        .dt.strftime(
-            "%d.%m.%Y %H:%M:%S UTC"
-        )
+        .dt.strftime("%d.%m.%Y %H:%M:%S UTC")
     )
 
     grouped = grouped.rename(
         columns={
-            "participant_id":
-                "Teilnehmer-ID",
+            "participant_id": "Teilnehmer-ID",
         }
     )
 
@@ -491,284 +542,213 @@ def build_submission_overview(raw_df):
 
 def build_card_analysis(raw_df):
     """
-    Berechnet pro Karte:
-    - Häufigkeit je CEFR-Kategorie
-    - Mehrheitskategorie
-    - Übereinstimmung
-    - Dissens
-    - Spannweite
-    - normalisierte Entropie
+    Berechnet pro Karte sowohl Interrater-Konsens als auch
+    den Vergleich mit dem hinterlegten Referenzniveau.
     """
-    rows = []
-
-    category_positions = {
-        category: index
-        for index, category
-        in enumerate(CATEGORIES)
+    result_rows = []
+    level_positions = {
+        level: index
+        for index, level
+        in enumerate(LEVELS)
     }
 
-    for card_id in sorted(CARDS):
+    ordered_card_ids = sorted(
+        CARDS,
+        key=lambda card_id: CARD_METADATA[card_id]["sort_order"],
+    )
+
+    for card_id in ordered_card_ids:
+        meta = CARD_METADATA[card_id]
         card_rows = raw_df[
-            raw_df["card_id"]
-            == card_id
+            raw_df["card_id"] == card_id
         ]
 
         counts_series = (
-            card_rows["category"]
+            card_rows["participant_level"]
             .value_counts()
             .reindex(
-                CATEGORIES,
+                LEVELS,
                 fill_value=0,
             )
         )
 
         counts = {
-            category:
-                int(counts_series[category])
-            for category
-            in CATEGORIES
+            level: int(counts_series[level])
+            for level in LEVELS
         }
-
-        number_ratings = int(
-            counts_series.sum()
-        )
+        number_ratings = int(counts_series.sum())
+        reference_level = meta["reference_level"]
 
         if number_ratings > 0:
-            max_count = int(
-                counts_series.max()
-            )
-
-            modal_categories = [
-                category
-                for category
-                in CATEGORIES
-                if (
-                    counts[category]
-                    == max_count
-                )
+            max_count = int(counts_series.max())
+            modal_levels = [
+                level
+                for level in LEVELS
+                if counts[level] == max_count
             ]
-
-            majority = " / ".join(
-                modal_categories
-            )
-
-            agreement = (
-                max_count
-                / number_ratings
-                * 100
-            )
-
-            dissent = (
-                100
-                - agreement
-            )
+            majority = " / ".join(modal_levels)
+            agreement = max_count / number_ratings * 100
+            dissent = 100 - agreement
 
             used_positions = [
-                category_positions[
-                    category
-                ]
-                for category
-                in CATEGORIES
-                if counts[category] > 0
+                level_positions[level]
+                for level in LEVELS
+                if counts[level] > 0
             ]
-
-            spread = (
-                max(used_positions)
-                - min(used_positions)
-            )
+            spread = max(used_positions) - min(used_positions)
 
             probabilities = [
-                counts[category]
-                / number_ratings
-                for category
-                in CATEGORIES
-                if counts[category] > 0
+                counts[level] / number_ratings
+                for level in LEVELS
+                if counts[level] > 0
             ]
-
             entropy = (
                 -sum(
-                    probability
-                    * math.log(
-                        probability
-                    )
-                    for probability
-                    in probabilities
+                    p * math.log(p)
+                    for p in probabilities
                 )
-                / math.log(
-                    len(CATEGORIES)
-                )
+                / math.log(len(LEVELS))
                 * 100
             )
 
+            reference_match = (
+                counts[reference_level]
+                / number_ratings
+                * 100
+            )
+
+            reference_position = level_positions[reference_level]
+            mean_abs_deviation = (
+                sum(
+                    counts[level]
+                    * abs(level_positions[level] - reference_position)
+                    for level in LEVELS
+                )
+                / number_ratings
+            )
+
+            majority_matches_reference = (
+                reference_level in modal_levels
+            )
         else:
             majority = "—"
             agreement = 0.0
             dissent = 0.0
             spread = 0
             entropy = 0.0
+            reference_match = 0.0
+            mean_abs_deviation = 0.0
+            majority_matches_reference = False
 
-        rows.append(
+        result_rows.append(
             {
-                "Karte":
-                    card_id,
-
-                "Text":
-                    CARDS[card_id],
-
-                "Bewertungen":
-                    number_ratings,
-
-                "Pre-A1":
-                    counts["Pre-A1"],
-
-                "A1":
-                    counts["A1"],
-
-                "A2":
-                    counts["A2"],
-
-                "B1":
-                    counts["B1"],
-
-                "B2":
-                    counts["B2"],
-
-                "Mehrheit":
-                    majority,
-
-                "Übereinstimmung %":
-                    round(
-                        agreement,
-                        1,
-                    ),
-
-                "Dissens %":
-                    round(
-                        dissent,
-                        1,
-                    ),
-
-                "Spannweite":
-                    spread,
-
-                "Entropie %":
-                    round(
-                        entropy,
-                        1,
-                    ),
+                "Reihenfolge": meta["sort_order"],
+                "Karte": card_id,
+                "Text": meta["card_text"],
+                "Kategorie": meta["item_category"],
+                "Kategorie-Nr": meta["category_number"],
+                "Referenzniveau": reference_level,
+                "Level-Nr": meta["level_number"],
+                "Bewertungen": number_ratings,
+                "Pre-A1": counts["Pre-A1"],
+                "A1": counts["A1"],
+                "A2": counts["A2"],
+                "B1": counts["B1"],
+                "B2": counts["B2"],
+                "Mehrheit": majority,
+                "Mehrheit = Referenz": (
+                    "Ja" if majority_matches_reference else "Nein"
+                ),
+                "Übereinstimmung %": round(agreement, 1),
+                "Dissens %": round(dissent, 1),
+                "Referenz-Treffer %": round(reference_match, 1),
+                "Ø Abweichung zur Referenz": round(mean_abs_deviation, 2),
+                "Spannweite": spread,
+                "Entropie %": round(entropy, 1),
             }
         )
 
-    return pd.DataFrame(
-        rows
-    )
-
+    return pd.DataFrame(result_rows)
 
 
 def full_table_height(df):
-    """
-    Berechnet genug Höhe, damit ein st.dataframe
-    alle Zeilen ohne eigenen vertikalen Scrollbereich zeigt.
-    """
-    row_height = 35
-    header_height = 40
-    padding = 8
+    """Genug Höhe, damit nur die Browserseite vertikal scrollt."""
+    return 48 + len(df) * 35
 
-    return (
-        header_height
-        + len(df) * row_height
-        + padding
-    )
-def render_admin_dashboard(
-    rows,
-):
-    """
-    Das eigentliche Dashboard mit fünf Ansichten.
-    """
-    raw_df = results_to_dataframe(
-        rows
-    )
 
-    submissions_df = (
-        build_submission_overview(
-            raw_df
+def build_group_summary(card_analysis_df, group_column, order_column=None):
+    if card_analysis_df.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        card_analysis_df
+        .groupby(group_column, as_index=False)
+        .agg(
+            Karten=("Karte", "count"),
+            **{
+                "Ø Übereinstimmung %": ("Übereinstimmung %", "mean"),
+                "Ø Referenz-Treffer %": ("Referenz-Treffer %", "mean"),
+                "Ø Abweichung": ("Ø Abweichung zur Referenz", "mean"),
+            },
         )
     )
 
-    card_analysis_df = (
-        build_card_analysis(
-            raw_df
+    if order_column is not None:
+        order_map = (
+            card_analysis_df[[group_column, order_column]]
+            .drop_duplicates()
+            .set_index(group_column)[order_column]
+            .to_dict()
         )
-    )
+        grouped["__order"] = grouped[group_column].map(order_map)
+        grouped = grouped.sort_values("__order").drop(columns="__order")
 
-    number_submissions = len(
-        submissions_df
-    )
+    for column in [
+        "Ø Übereinstimmung %",
+        "Ø Referenz-Treffer %",
+        "Ø Abweichung",
+    ]:
+        grouped[column] = grouped[column].round(1 if "%" in column else 2)
 
-    number_assignments = len(
-        raw_df
-    )
+    return grouped
 
+
+def render_admin_dashboard(rows):
+    raw_df = results_to_dataframe(rows)
+    submissions_df = build_submission_overview(raw_df)
+    card_analysis_df = build_card_analysis(raw_df)
+
+    number_submissions = len(submissions_df)
+    number_assignments = len(raw_df)
     perfect_consensus_count = int(
         (
-            card_analysis_df[
-                "Übereinstimmung %"
-            ]
-            == 100.0
+            (card_analysis_df["Übereinstimmung %"] == 100.0)
+            & (card_analysis_df["Bewertungen"] > 0)
         ).sum()
     )
-
     low_agreement_count = int(
         (
-            (
-                card_analysis_df[
-                    "Übereinstimmung %"
-                ]
-                < 50.0
-            )
-            & (
-                card_analysis_df[
-                    "Bewertungen"
-                ]
-                > 0
-            )
+            (card_analysis_df["Übereinstimmung %"] < 50.0)
+            & (card_analysis_df["Bewertungen"] > 0)
         ).sum()
     )
 
     if submissions_df.empty:
         last_submission = "—"
     else:
-        last_submission = (
-            submissions_df.iloc[0][
-                "Zeitpunkt (UTC)"
-            ]
-        )
+        last_submission = submissions_df.iloc[0]["Zeitpunkt (UTC)"]
 
-    st.title(
-        "📊 Admin-Dashboard"
-    )
+    st.title("📊 Admin-Dashboard")
 
-    top_left, top_right = (
-        st.columns(
-            [3, 1]
-        )
-    )
-
+    top_left, top_right = st.columns([3, 1])
     with top_left:
         st.caption(
-            "Die Kennzahlen werden live aus "
-            "Supabase/PostgreSQL berechnet."
+            "Live-Auswertung aus Supabase/PostgreSQL. "
+            "Die Teilnehmeransicht erhält die versteckten Stammdaten nicht."
         )
-
     with top_right:
-        if st.button(
-            "← Zur Umfrage",
-            use_container_width=True,
-        ):
-            st.session_state[
-                "admin_dashboard_open"
-            ] = False
-
+        if st.button("← Zur Umfrage", use_container_width=True):
+            st.session_state["admin_dashboard_open"] = False
             st.rerun()
 
     (
@@ -787,259 +767,188 @@ def render_admin_dashboard(
         ]
     )
 
-    # ---------------------------------------------------------
     # 1. Überblick
-    # ---------------------------------------------------------
     with tab_overview:
-        (
-            metric_1,
-            metric_2,
-            metric_3,
-            metric_4,
-        ) = st.columns(4)
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+        metric_1.metric("Abgaben", number_submissions)
+        metric_2.metric("Zuordnungen", number_assignments)
+        metric_3.metric("100 % Konsens", perfect_consensus_count)
+        metric_4.metric("< 50 % Übereinstimmung", low_agreement_count)
 
-        metric_1.metric(
-            "Abgaben",
-            number_submissions,
-        )
-
-        metric_2.metric(
-            "Zuordnungen",
-            number_assignments,
-        )
-
-        metric_3.metric(
-            "100 % Konsens",
-            perfect_consensus_count,
-        )
-
-        metric_4.metric(
-            "< 50 % Übereinstimmung",
-            low_agreement_count,
-        )
-
-        st.write(
-            f"**Letzte Abgabe:** "
-            f"{last_submission}"
-        )
+        st.write(f"**Letzte Abgabe:** {last_submission}")
+        st.write(f"**Aktive Karten in der Erhebung:** {len(CARDS)}")
 
         st.divider()
+        st.subheader("Auswertung nach Kategorie und Referenzniveau")
 
-        st.subheader(
-            "Downloads"
+        category_summary = build_group_summary(
+            card_analysis_df,
+            "Kategorie",
+            "Kategorie-Nr",
+        )
+        level_summary = build_group_summary(
+            card_analysis_df,
+            "Referenzniveau",
+            "Level-Nr",
         )
 
-        raw_csv = (
-            create_results_csv(
-                rows
+        summary_left, summary_right = st.columns(2)
+        with summary_left:
+            st.markdown("**Nach inhaltlicher Kategorie**")
+            st.dataframe(
+                category_summary,
+                hide_index=True,
+                use_container_width=True,
+                height=full_table_height(category_summary),
             )
-        )
+        with summary_right:
+            st.markdown("**Nach Referenzniveau**")
+            st.dataframe(
+                level_summary,
+                hide_index=True,
+                use_container_width=True,
+                height=full_table_height(level_summary),
+            )
 
+        st.divider()
+        st.subheader("Downloads")
+
+        raw_csv = create_results_csv(rows)
         analysis_csv = (
             card_analysis_df
-            .to_csv(
-                index=False,
-            )
-            .encode(
-                "utf-8-sig"
-            )
+            .to_csv(index=False)
+            .encode("utf-8-sig")
         )
 
-        download_1, download_2 = (
-            st.columns(2)
-        )
-
+        download_1, download_2 = st.columns(2)
         with download_1:
             st.download_button(
-                label=(
-                    "📥 Rohdaten als CSV"
-                ),
+                "📥 Rohdaten als CSV",
                 data=raw_csv,
-                file_name=(
-                    "ergebnisse_rohdaten.csv"
-                ),
+                file_name="ergebnisse_rohdaten.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
-
         with download_2:
             st.download_button(
-                label=(
-                    "📥 Kartenanalyse als CSV"
-                ),
+                "📥 Kartenanalyse als CSV",
                 data=analysis_csv,
-                file_name=(
-                    "kartenanalyse.csv"
-                ),
+                file_name="kartenanalyse.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
 
         st.caption(
-            "Übereinstimmung = Anteil der häufigsten "
-            "Einstufung. Spannweite = Abstand zwischen "
-            "der niedrigsten und höchsten verwendeten "
-            "CEFR-Kategorie. Entropie beschreibt, wie "
-            "stark sich die Antworten über mehrere "
-            "Kategorien verteilen."
+            "Übereinstimmung = Anteil der häufigsten Einstufung. "
+            "Referenz-Treffer = Anteil der Teilnehmenden, die genau das "
+            "hinterlegte Referenzniveau wählen. Ø Abweichung misst den "
+            "mittleren ordinalen Abstand zum Referenzniveau (0 = identisch, "
+            "1 = eine Stufe, usw.)."
         )
 
-    # ---------------------------------------------------------
-    # 2. Alle Submissions
-    # ---------------------------------------------------------
+    # 2. Abgaben
     with tab_submissions:
-        st.subheader(
-            "Alle Abgaben"
-        )
-
+        st.subheader("Alle Abgaben")
         if submissions_df.empty:
-            st.info(
-                "Noch keine Abgaben vorhanden."
-            )
-
+            st.info("Noch keine Abgaben vorhanden.")
         else:
             st.dataframe(
                 submissions_df,
                 hide_index=True,
                 use_container_width=True,
-                height=full_table_height(
-                    submissions_df
-                ),
+                height=full_table_height(submissions_df),
             )
 
-    # ---------------------------------------------------------
-    # 3. Analyse aller Karten
-    # ---------------------------------------------------------
+    # 3. Kartenanalyse
     with tab_cards:
-        st.subheader(
-            "Alle Karteikarten"
+        st.subheader("Alle Karteikarten")
+        st.caption(
+            "Die Tabelle ist in Ihrer hinterlegten sort_order sortiert. "
+            "Diese Reihenfolge wird den Teilnehmenden nicht gezeigt."
         )
-
         st.dataframe(
             card_analysis_df,
             hide_index=True,
             use_container_width=True,
-            height=full_table_height(
-                card_analysis_df
-            ),
+            height=full_table_height(card_analysis_df),
             column_config={
-                "Übereinstimmung %":
-                    st.column_config.ProgressColumn(
-                        "Übereinstimmung %",
-                        min_value=0,
-                        max_value=100,
-                        format="%.1f %%",
-                    ),
-        
-                "Dissens %":
-                    st.column_config.NumberColumn(
-                        "Dissens %",
-                        format="%.1f %%",
-                    ),
-        
-                "Entropie %":
-                    st.column_config.NumberColumn(
-                        "Entropie %",
-                        format="%.1f %%",
-                    ),
+                "Übereinstimmung %": st.column_config.ProgressColumn(
+                    "Übereinstimmung %",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f %%",
+                ),
+                "Referenz-Treffer %": st.column_config.ProgressColumn(
+                    "Referenz-Treffer %",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f %%",
+                ),
+                "Dissens %": st.column_config.NumberColumn(
+                    "Dissens %",
+                    format="%.1f %%",
+                ),
+                "Entropie %": st.column_config.NumberColumn(
+                    "Entropie %",
+                    format="%.1f %%",
+                ),
             },
         )
 
-    # ---------------------------------------------------------
-    # 4. TOP 10 mit vollständigem Konsens
-    # ---------------------------------------------------------
+    # 4. TOP 10 vollständiger Konsens
     with tab_consensus:
-        st.subheader(
-            "TOP 10 – vollständiger Konsens"
-        )
-
+        st.subheader("TOP 10 – vollständiger Konsens")
         st.write(
-            "Hier erscheinen nur Karten, bei denen "
-            "**100 % der Teilnehmenden dieselbe "
-            "Kategorie gewählt haben**."
+            "Hier erscheinen Karten, bei denen **100 % der Teilnehmenden "
+            "dieselbe Einstufung gewählt haben**. Zusätzlich sehen Sie, "
+            "ob dieser Konsens dem Referenzniveau entspricht."
         )
 
         perfect_df = (
             card_analysis_df[
-                (
-                    card_analysis_df[
-                        "Übereinstimmung %"
-                    ]
-                    == 100.0
-                )
-                & (
-                    card_analysis_df[
-                        "Bewertungen"
-                    ]
-                    > 0
-                )
+                (card_analysis_df["Übereinstimmung %"] == 100.0)
+                & (card_analysis_df["Bewertungen"] > 0)
             ]
             .sort_values(
-                [
-                    "Bewertungen",
-                    "Karte",
-                ],
-                ascending=[
-                    False,
-                    True,
-                ],
+                ["Bewertungen", "Reihenfolge"],
+                ascending=[False, True],
             )
             .head(10)
         )
 
         if perfect_df.empty:
-            st.info(
-                "Aktuell gibt es keine Karte "
-                "mit 100 % Übereinstimmung."
-            )
-
+            st.info("Aktuell gibt es keine Karte mit 100 % Übereinstimmung.")
         else:
+            perfect_view = perfect_df[
+                [
+                    "Karte",
+                    "Text",
+                    "Kategorie",
+                    "Referenzniveau",
+                    "Bewertungen",
+                    "Mehrheit",
+                    "Mehrheit = Referenz",
+                    "Übereinstimmung %",
+                ]
+            ]
             st.dataframe(
-                perfect_df[
-                    [
-                        "Karte",
-                        "Text",
-                        "Bewertungen",
-                        "Mehrheit",
-                        "Übereinstimmung %",
-                    ]
-                ],
+                perfect_view,
                 hide_index=True,
                 use_container_width=True,
+                height=full_table_height(perfect_view),
             )
 
-            if (
-                perfect_consensus_count
-                > 10
-            ):
-                st.caption(
-                    f"Insgesamt gibt es "
-                    f"{perfect_consensus_count} "
-                    "Karten mit 100 % Konsens. "
-                    "Angezeigt werden die ersten 10."
-                )
-
-    # ---------------------------------------------------------
-    # 5. Problemfälle / Dissens
-    # ---------------------------------------------------------
+    # 5. Problemfälle
     with tab_dissent:
-        st.subheader(
-            "Besonders problematische Karten"
-        )
-
+        st.subheader("Besonders problematische Karten")
         st.write(
-            "Sortierung: zuerst **geringe "
-            "Übereinstimmung**, bei Gleichstand "
-            "eine **größere Spannweite** und danach "
-            "eine **höhere Entropie**."
+            "Sortierung: zuerst geringe Übereinstimmung, bei Gleichstand "
+            "größere Spannweite und danach höhere Entropie."
         )
 
         problematic_df = (
             card_analysis_df[
-                card_analysis_df[
-                    "Bewertungen"
-                ]
-                > 0
+                card_analysis_df["Bewertungen"] > 0
             ]
             .sort_values(
                 [
@@ -1047,198 +956,119 @@ def render_admin_dashboard(
                     "Spannweite",
                     "Entropie %",
                 ],
-                ascending=[
-                    True,
-                    False,
-                    False,
-                ],
+                ascending=[True, False, False],
             )
             .head(10)
         )
 
         if problematic_df.empty:
-            st.info(
-                "Noch keine bewerteten Karten vorhanden."
-            )
-
+            st.info("Noch keine bewerteten Karten vorhanden.")
         else:
+            problem_view = problematic_df[
+                [
+                    "Karte",
+                    "Text",
+                    "Kategorie",
+                    "Referenzniveau",
+                    "Bewertungen",
+                    "Mehrheit",
+                    "Übereinstimmung %",
+                    "Dissens %",
+                    "Referenz-Treffer %",
+                    "Ø Abweichung zur Referenz",
+                    "Spannweite",
+                    "Entropie %",
+                ]
+            ]
             st.dataframe(
-                problematic_df[
-                    [
-                        "Karte",
-                        "Text",
-                        "Bewertungen",
-                        "Mehrheit",
-                        "Übereinstimmung %",
-                        "Dissens %",
-                        "Spannweite",
-                        "Entropie %",
-                    ]
-                ],
+                problem_view,
                 hide_index=True,
                 use_container_width=True,
-                height=full_table_height(
-                    problematic_df
-                ),
+                height=full_table_height(problem_view),
                 column_config={
-                    "Übereinstimmung %":
-                        st.column_config.ProgressColumn(
-                            "Übereinstimmung %",
-                            min_value=0,
-                            max_value=100,
-                            format="%.1f %%",
-                        ),
-            
-                    "Dissens %":
-                        st.column_config.NumberColumn(
-                            "Dissens %",
-                            format="%.1f %%",
-                        ),
-            
-                    "Entropie %":
-                        st.column_config.NumberColumn(
-                            "Entropie %",
-                            format="%.1f %%",
-                        ),
+                    "Übereinstimmung %": st.column_config.ProgressColumn(
+                        "Übereinstimmung %",
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f %%",
+                    ),
+                    "Referenz-Treffer %": st.column_config.ProgressColumn(
+                        "Referenz-Treffer %",
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f %%",
+                    ),
+                    "Dissens %": st.column_config.NumberColumn(
+                        "Dissens %",
+                        format="%.1f %%",
+                    ),
+                    "Entropie %": st.column_config.NumberColumn(
+                        "Entropie %",
+                        format="%.1f %%",
+                    ),
                 },
             )
 
+
 def render_admin_area():
-    """
-    Login in der Seitenleiste.
-    Nach erfolgreicher Anmeldung wird das Dashboard
-    im Hauptbereich geöffnet.
-    """
     with st.sidebar:
-        with st.expander(
-            "🔒 Admin-Bereich",
-            expanded=False,
-        ):
-
-            if not st.session_state.get(
-                "admin_granted",
-                False,
-            ):
-                with st.form(
-                    "admin_login_form"
-                ):
-                    entered_admin_code = (
-                        st.text_input(
-                            "Admin-Code",
-                            type="password",
-                        )
+        with st.expander("🔒 Admin-Bereich", expanded=False):
+            if not st.session_state.get("admin_granted", False):
+                with st.form("admin_login_form"):
+                    entered_admin_code = st.text_input(
+                        "Admin-Code",
+                        type="password",
                     )
-
-                    login = (
-                        st.form_submit_button(
-                            "Admin öffnen"
-                        )
-                    )
+                    login = st.form_submit_button("Admin öffnen")
 
                 if login:
                     try:
-                        correct_admin_code = str(
-                            st.secrets[
-                                "ADMIN_CODE"
-                            ]
-                        )
-
+                        correct_admin_code = str(st.secrets["ADMIN_CODE"])
                     except Exception:
                         st.error(
-                            "ADMIN_CODE wurde noch "
-                            "nicht in den "
-                            "Streamlit-Secrets "
-                            "konfiguriert."
+                            "ADMIN_CODE wurde noch nicht in den "
+                            "Streamlit-Secrets konfiguriert."
                         )
-
                         return
 
                     if hmac.compare_digest(
                         entered_admin_code.strip(),
                         correct_admin_code,
                     ):
-                        st.session_state[
-                            "admin_granted"
-                        ] = True
-
-                        st.session_state[
-                            "admin_dashboard_open"
-                        ] = True
-
+                        st.session_state["admin_granted"] = True
+                        st.session_state["admin_dashboard_open"] = True
                         st.rerun()
-
                     else:
-                        st.error(
-                            "Admin-Code nicht korrekt."
-                        )
+                        st.error("Admin-Code nicht korrekt.")
 
                 return
 
-            st.success(
-                "Admin angemeldet"
-            )
+            st.success("Admin angemeldet")
 
-            if st.button(
-                "📊 Dashboard öffnen",
-                use_container_width=True,
-            ):
-                st.session_state[
-                    "admin_dashboard_open"
-                ] = True
-
+            if st.button("📊 Dashboard öffnen", use_container_width=True):
+                st.session_state["admin_dashboard_open"] = True
                 st.rerun()
 
-            if st.button(
-                "Admin abmelden",
-                use_container_width=True,
-            ):
-                st.session_state[
-                    "admin_granted"
-                ] = False
-
-                st.session_state[
-                    "admin_dashboard_open"
-                ] = False
-
+            if st.button("Admin abmelden", use_container_width=True):
+                st.session_state["admin_granted"] = False
+                st.session_state["admin_dashboard_open"] = False
                 st.rerun()
 
-    if not st.session_state.get(
-        "admin_granted",
-        False,
-    ):
+    if not st.session_state.get("admin_granted", False):
         return
 
-    if not st.session_state.get(
-        "admin_dashboard_open",
-        False,
-    ):
+    if not st.session_state.get("admin_dashboard_open", False):
         return
 
     try:
         rows = load_results()
-
     except psycopg.Error as exc:
-        print(
-            "Fehler beim Laden "
-            "der Admin-Daten:",
-            repr(exc),
-        )
-
-        st.error(
-            "Die Ergebnisse konnten "
-            "nicht geladen werden."
-        )
-
+        print("Fehler beim Laden der Admin-Daten:", repr(exc))
+        st.error("Die Ergebnisse konnten nicht geladen werden.")
         st.stop()
 
-    render_admin_dashboard(
-        rows
-    )
-
-    # Wenn das Dashboard offen ist, wird darunter
-    # nicht zusätzlich die Teilnehmeransicht gerendert.
+    render_admin_dashboard(rows)
     st.stop()
-
 
 
 # -------------------------------------------------------------------
@@ -1284,7 +1114,7 @@ COMPONENT_HTML = r"""
     Sechs Spalten über die verfügbare Breite.
 
     Die erste Spalte erhält etwas mehr Raum,
-    weil dort anfangs alle 50 Karten liegen.
+    weil dort anfangs alle Karten liegen.
     */
     #board {
         display: grid;
@@ -2082,7 +1912,6 @@ def card_sorter(board, key):
         default=board,
     )
 
-
 # -------------------------------------------------------------------
 # Streamlit-App
 # -------------------------------------------------------------------
@@ -2092,7 +1921,6 @@ st.set_page_config(
     page_icon="🗂️",
     layout="wide",
 )
-
 
 # Möglichst viel Bildschirmbreite verwenden.
 st.markdown(
@@ -2108,14 +1936,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 def require_access_code():
-    # Wenn der Zugang in dieser Sitzung schon freigeschaltet wurde,
-    # muss der Code nicht erneut eingegeben werden.
     if st.session_state.get("access_granted", False):
         return
 
     st.title("🔐 Zugang zur Umfrage")
-
     st.write(
         "Bitte geben Sie den Zugangscode ein, "
         "um zu beginnen."
@@ -2126,7 +1952,6 @@ def require_access_code():
             "Zugangscode",
             type="password",
         )
-
         submitted = st.form_submit_button(
             "Weiter",
             type="primary",
@@ -2134,13 +1959,9 @@ def require_access_code():
 
     if submitted:
         try:
-            correct_code = str(
-                st.secrets["ACCESS_CODE"]
-            )
+            correct_code = str(st.secrets["ACCESS_CODE"])
         except Exception:
-            st.error(
-                "Es wurde noch kein Zugangscode konfiguriert."
-            )
+            st.error("Es wurde noch kein Zugangscode konfiguriert.")
             st.stop()
 
         if hmac.compare_digest(
@@ -2149,62 +1970,68 @@ def require_access_code():
         ):
             st.session_state.access_granted = True
             st.rerun()
-
         else:
-            st.error(
-                "Der Zugangscode ist nicht korrekt."
-            )
+            st.error("Der Zugangscode ist nicht korrekt.")
 
-    # Alles, was danach in app.py steht, wird erst ausgeführt,
-    # wenn der richtige Code eingegeben wurde.
     st.stop()
 
-require_access_code()
 
+require_access_code()
 init_db()
+
+# Kartenstammdaten aus Supabase laden.
+CARDS, CARD_METADATA = load_cards()
+
+if not CARDS:
+    st.error(
+        "In public.cards wurden noch keine Karteikarten gefunden. "
+        "Bitte zuerst die Stammdaten in Supabase importieren."
+    )
+    st.stop()
+
+LABEL_TO_ID = {
+    f"{card_id} · {text}": card_id
+    for card_id, text in CARDS.items()
+}
+
+ID_TO_LABEL = {
+    card_id: label
+    for label, card_id in LABEL_TO_ID.items()
+}
 
 render_admin_area()
 
-if "board" not in st.session_state:
-    st.session_state.board = (
-        initial_board()
-    )
-
-
-if (
-    "sorter_generation"
-    not in st.session_state
-):
+if "sorter_generation" not in st.session_state:
     st.session_state.sorter_generation = 0
 
+# Bei einem Deployment mit geänderten Karten wird ein alter Browserzustand
+# automatisch verworfen, damit keine alten Labels in der Erhebung bleiben.
+if (
+    "board" not in st.session_state
+    or not is_safe_board_payload(st.session_state.board)
+):
+    st.session_state.pop("card_order", None)
+    st.session_state.board = initial_board()
+    st.session_state.sorter_generation += 1
 
 if "submitted" not in st.session_state:
     st.session_state.submitted = False
 
 
 def start_new_entry():
-    st.session_state.board = (
-        initial_board()
-    )
-
+    # Neue Person am gleichen Browser -> neue zufällige Kartenreihenfolge.
+    st.session_state.pop("card_order", None)
+    st.session_state.board = initial_board()
     st.session_state.sorter_generation += 1
-
     st.session_state.submitted = False
-
     st.session_state.participant_id = ""
 
 
-st.title(
-    "🗂️ Karteikarten-Zuordnung"
-)
-
+st.title("🗂️ Karteikarten-Zuordnung")
 st.write(
-    "Ordnen Sie die Deskriptoren dem Kompetenzniveau zu,  .“ "
-    "in dem ein:e minimal kompetente:r Leser:in die beschriebene "
-    " Leseleistung ohne Unterstützung zuverlässig erbringt."
-    "**Pre-A1, A1, A2, B1 oder B2**."
+    f"Ordnen Sie bitte jede der **{len(CARDS)} Karten** per Drag & Drop "
+    "genau einer Kategorie zu: **Pre-A1, A1, A2, B1 oder B2**."
 )
-
 
 participant_id = st.text_input(
     "Teilnehmer-ID",
@@ -2217,27 +2044,22 @@ participant_id = st.text_input(
     disabled=st.session_state.submitted,
 )
 
-
 if st.session_state.submitted:
     st.success(
         "Vielen Dank! Ihre Zuordnung wurde gespeichert. "
         "Sie können die Seite jetzt schließen."
     )
-
     st.button(
         "Neue Eingabe starten",
         type="secondary",
         on_click=start_new_entry,
     )
-
     st.stop()
-
 
 st.caption(
     "Tipp: Ziehen Sie die Karten in die gewünschte Kategorie. "
-    "Karten können jederzeit zwischen den Kategorien verschoben werden."
+    "Die Kartenreihenfolge wurde für diese Sitzung zufällig gemischt."
 )
-
 
 component_result = card_sorter(
     st.session_state.board,
@@ -2247,71 +2069,34 @@ component_result = card_sorter(
     ),
 )
 
-
-# Wenn der Browser eine neue Zuordnung meldet,
-# übernehmen wir sie und führen genau einen sauberen
-# Streamlit-Rerun aus.
-if (
-    component_result
-    != st.session_state.board
-):
-    if is_safe_board_payload(
-        component_result
-    ):
-        st.session_state.board = (
-            component_result
-        )
-
+if component_result != st.session_state.board:
+    if is_safe_board_payload(component_result):
+        st.session_state.board = component_result
         st.rerun()
 
+status = validate_board(st.session_state.board)
+assigned = len(CARDS) - status["unassigned_count"]
 
-status = validate_board(
-    st.session_state.board
-)
-
-assigned = (
-    len(CARDS)
-    - status["unassigned_count"]
-)
-
-
-st.progress(
-    assigned / len(CARDS)
-)
-
+st.progress(assigned / len(CARDS))
 st.write(
-    f"**{assigned} von "
-    f"{len(CARDS)} Karten zugeordnet.**"
+    f"**{assigned} von {len(CARDS)} Karten zugeordnet.**"
 )
 
-
-if (
-    status["unassigned_count"]
-    > 0
-):
+if status["unassigned_count"] > 0:
     st.info(
-        f"Noch "
-        f"{status['unassigned_count']} "
-        "Karte(n) nicht zugeordnet."
+        f"Noch {status['unassigned_count']} Karte(n) nicht zugeordnet."
     )
-
 elif status["is_valid"]:
     st.success(
-        "Alle 50 Karten sind vollständig "
-        "und eindeutig zugeordnet."
+        f"Alle {len(CARDS)} Karten sind vollständig und eindeutig zugeordnet."
     )
-
 else:
     st.error(
         "Die Kartenstruktur ist inkonsistent. "
         "Bitte setzen Sie die Zuordnung zurück."
     )
 
-
-button_col, reset_col = st.columns(
-    [2, 1]
-)
-
+button_col, reset_col = st.columns([2, 1])
 
 with button_col:
     submit = st.button(
@@ -2321,89 +2106,50 @@ with button_col:
         disabled=not status["is_valid"],
     )
 
-
 with reset_col:
     reset = st.button(
         "Zuordnung zurücksetzen",
         use_container_width=True,
     )
 
-
 if reset:
-    st.session_state.board = (
-        initial_board()
-    )
-
+    # Beim Zurücksetzen derselben Person bleibt die zufällige Ausgangsreihenfolge gleich.
+    st.session_state.board = initial_board()
     st.session_state.sorter_generation += 1
-
     st.rerun()
 
-
 if submit:
-    clean_participant_id = (
-        participant_id.strip()
-    )
+    clean_participant_id = participant_id.strip()
 
     if not clean_participant_id:
-        st.error(
-            "Bitte geben Sie zuerst "
-            "eine Teilnehmer-ID ein."
-        )
-
-    elif (
-        len(clean_participant_id)
-        > 100
-    ):
-        st.error(
-            "Die Teilnehmer-ID darf "
-            "höchstens 100 Zeichen lang sein."
-        )
-
+        st.error("Bitte geben Sie zuerst eine Teilnehmer-ID ein.")
+    elif len(clean_participant_id) > 100:
+        st.error("Die Teilnehmer-ID darf höchstens 100 Zeichen lang sein.")
     else:
-        assignments = (
-            board_to_assignments(
-                st.session_state.board
-            )
-        )
+        assignments = board_to_assignments(st.session_state.board)
 
-        if (
-            len(assignments)
-            != len(CARDS)
-        ):
+        if len(assignments) != len(CARDS):
             st.error(
-                "Es konnten nicht alle "
-                "50 Zuordnungen gelesen werden. "
+                f"Es konnten nicht alle {len(CARDS)} Zuordnungen gelesen werden. "
                 "Bitte prüfen Sie die Karten."
             )
-
         else:
             try:
                 save_submission(
                     clean_participant_id,
                     assignments,
                 )
-
             except psycopg.errors.UniqueViolation:
                 st.error(
-                    "Diese Teilnehmer-ID wurde "
-                    "bereits verwendet. "
-                    "Bitte prüfen Sie die ID "
-                    "oder verwenden Sie eine andere."
+                    "Diese Teilnehmer-ID wurde bereits verwendet. "
+                    "Bitte prüfen Sie die ID oder verwenden Sie eine andere."
                 )
-            
             except psycopg.Error as exc:
-                # Technische Details nur im Streamlit-Log ausgeben.
-                print(
-                    "PostgreSQL-Datenbankfehler:",
-                    repr(exc),
-                )
-            
+                print("PostgreSQL-Datenbankfehler:", repr(exc))
                 st.error(
-                    "Beim Speichern ist ein Datenbankfehler "
-                    "aufgetreten. Bitte versuchen Sie es erneut."
+                    "Beim Speichern ist ein Datenbankfehler aufgetreten. "
+                    "Bitte versuchen Sie es erneut."
                 )
-
             else:
                 st.session_state.submitted = True
-
                 st.rerun()
