@@ -2199,8 +2199,9 @@ st.title(
 )
 
 st.write(
-    "Ordnen Sie bitte jede der 50 Karten "
-    "per Drag & Drop genau einer Kategorie zu: "
+    "Ordnen Sie die Deskriptoren dem Kompetenzniveau zu,  .“ "
+    "in dem ein:e minimal kompetente:r Leser:in die beschriebene "
+    " Leseleistung ohne Unterstützung zuverlässig erbringt."
     "**Pre-A1, A1, A2, B1 oder B2**."
 )
 
